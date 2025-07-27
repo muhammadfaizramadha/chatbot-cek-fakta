@@ -2,15 +2,16 @@ import logging
 import os
 import re
 import requests
+import json
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
-# --- KONFIGURASI AWAL ---
+# --- INITIAL CONFIGURATION ---
 load_dotenv()
 
-# Kredensial dari .env
+# Credentials from .env
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SEARCH_ENGINE_ID = os.getenv("SEARCH_ENGINE_ID")
@@ -23,17 +24,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- FUNGSI-FUNGSI FITUR BARU ---
+# --- NEW NOTIFICATION MANAGEMENT ---
+SUBSCRIBERS_FILE = 'subscribers.json'
+subscribers = set()
+last_sent_article_url = None
 
-def cross_reference_news(query: str) -> str:
-    """FITUR BARU: Mencari query di media mainstream Indonesia via NewsAPI."""
+def load_subscribers():
+    """Load subscriber list from JSON file."""
+    global subscribers
+    try:
+        with open(SUBSCRIBERS_FILE, 'r') as f:
+            subscribers = set(json.load(f))
+            logger.info(f"Successfully loaded {len(subscribers)} subscribers.")
+    except FileNotFoundError:
+        logger.info("subscribers.json not found, starting with an empty list.")
+        subscribers = set()
+
+def save_subscribers():
+    """Save subscriber list to JSON file."""
+    with open(SUBSCRIBERS_FILE, 'w') as f:
+        json.dump(list(subscribers), f)
+
+def fetch_latest_hoax() -> dict | None:
+    """Fetch the latest hoax clarification article from NewsAPI."""
+    # Query to find clarification/hoax news
+    query = '"klarifikasi hoaks" OR "cek fakta" OR "disinformasi"'
     url = "https://newsapi.org/v2/everything"
     params = {
         'q': query,
         'language': 'id',
-        'sortBy': 'relevancy',
-        'apiKey': NEWSAPI_KEY
+        'sortBy': 'publishedAt', # Get the newest
+        'apiKey': NEWSAPI_KEY,
+        'pageSize': 1
     }
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data['totalResults'] > 0:
+            return data['articles'][0] # Return the first (latest) article
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching latest hoax from NewsAPI: {e}")
+    return None
+
+async def send_hoax_notification(context: ContextTypes.DEFAULT_TYPE):
+    """Function run periodically to send notifications."""
+    global last_sent_article_url
+    logger.info("Running hoax notification check job...")
+
+    latest_article = fetch_latest_hoax()
+
+    if latest_article and latest_article.get('url') != last_sent_article_url:
+        last_sent_article_url = latest_article.get('url')
+        title = latest_article.get('title')
+        url = latest_article.get('url')
+        source = latest_article.get('source', {}).get('name')
+
+        message = (
+            f"🔔 *Notifikasi Hoaks Terbaru*\n\n"
+            f"*{title}*\n"
+            f"Sumber: {source}\n\n"
+            f"Baca klarifikasi lengkapnya di sini:\n{url}\n\n"
+            f"_Untuk berhenti menerima notifikasi, ketik /unsubscribe_"
+        )
+
+        # Send to all subscribers
+        for chat_id in list(subscribers): # Iterate over a copy
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                logger.info(f"Sent notification to {chat_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send notification to {chat_id}: {e}. Removing subscriber.")
+                subscribers.discard(chat_id)
+                save_subscribers()
+
+
+# --- EXISTING FEATURE FUNCTIONS (Unchanged) ---
+def cross_reference_news(query: str) -> str:
+    """Search query on mainstream Indonesian media via NewsAPI."""
+    url = "https://newsapi.org/v2/everything"
+    params = {'q': query, 'language': 'id', 'sortBy': 'relevancy', 'apiKey': NEWSAPI_KEY}
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
@@ -41,22 +111,18 @@ def cross_reference_news(query: str) -> str:
         if data['totalResults'] > 0:
             result_text = "📰 *Liputan dari Media Mainstream:*\n\n"
             for article in data['articles'][:3]:
-                result_text += f"▪️ *{article['source']['name']}:* {article['title']}\n"
-                result_text += f"  [Baca di sini]({article['url']})\n\n"
+                result_text += f"▪️ *{article['source']['name']}:* {article['title']}\n  [Baca di sini]({article['url']})\n\n"
             return result_text
         else:
             return "📰 *Liputan dari Media Mainstream:*\n\nTidak ditemukan liputan signifikan terkait isu ini di media arus utama."
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error saat menghubungi NewsAPI: {e}")
+        logger.error(f"Error calling NewsAPI: {e}")
         return "Gagal menghubungi layanan berita mainstream."
 
 def analyze_url_safety(url: str) -> str:
-    """FITUR BARU: Menganalisis keamanan URL via Google Web Risk API."""
+    """Analyze URL safety via Google Web Risk API."""
     api_url = f"https://webrisk.googleapis.com/v1/uris:search?key={GOOGLE_API_KEY}"
-    payload = {
-        'uri': url,
-        'threatTypes': ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE']
-    }
+    payload = {'uri': url, 'threatTypes': ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE']}
     try:
         response = requests.post(api_url, json=payload)
         data = response.json()
@@ -66,16 +132,12 @@ def analyze_url_safety(url: str) -> str:
         else:
             return f"✅ *Link Aman* ✅\n\nGoogle tidak menemukan ancaman keamanan pada link yang Anda kirim."
     except Exception as e:
-        logger.error(f"Error saat menghubungi Google Web Risk API: {e}")
+        logger.error(f"Error calling Google Web Risk API: {e}")
         return "Gagal menganalisis keamanan link."
 
 def verify_image(image_url: str) -> str:
-    """FITUR BARU: Melakukan reverse image search via SerpApi."""
-    params = {
-        "engine": "google_reverse_image",
-        "image_url": image_url,
-        "api_key": SERPAPI_KEY
-    }
+    """Perform a reverse image search via SerpApi."""
+    params = {"engine": "google_reverse_image", "image_url": image_url, "api_key": SERPAPI_KEY}
     try:
         response = requests.get('https://serpapi.com/search.json', params=params)
         response.raise_for_status()
@@ -83,18 +145,17 @@ def verify_image(image_url: str) -> str:
         if 'image_results' in results and len(results['image_results']) > 0:
             result_text = "🖼️ *Hasil Verifikasi Gambar (Reverse Image Search):*\n\nGambar ini pernah muncul di situs-situs berikut:\n\n"
             for item in results['image_results'][:5]:
-                result_text += f"▪️ *{item['source']}*: {item['title']}\n"
-                result_text += f"  [Lihat di sini]({item['link']})\n\n"
+                result_text += f"▪️ *{item['source']}*: {item['title']}\n  [Lihat di sini]({item['link']})\n\n"
             result_text += "_Cermati apakah konteks penggunaan gambar di situs-situs tersebut sama dengan berita yang Anda terima._"
             return result_text
         else:
             return "🖼️ *Hasil Verifikasi Gambar:*\n\nTidak ditemukan gambar serupa di internet. Ini bisa berarti gambar ini baru atau unik."
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error saat menghubungi SerpApi: {e}")
+        logger.error(f"Error calling SerpApi: {e}")
         return "Gagal melakukan verifikasi gambar."
 
-# --- FUNGSI LAMA (Tidak berubah) ---
 def search_fact_check(query: str) -> str:
+    """Search for a query on trusted fact-checking sites."""
     url = "https://www.googleapis.com/customsearch/v1"
     params = {'key': GOOGLE_API_KEY, 'cx': SEARCH_ENGINE_ID, 'q': query}
     try:
@@ -114,12 +175,13 @@ def search_fact_check(query: str) -> str:
     except requests.exceptions.RequestException:
         return "Gagal menghubungi layanan cek fakta."
 
-# --- HANDLER TELEGRAM (Diperbarui) ---
+# --- TELEGRAM HANDLERS (Updated) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mengirim pesan sambutan dengan tombol fitur yang sudah diperbarui."""
+    """Send a welcome message with an updated feature menu."""
     user = update.effective_user
     keyboard = [
+        [InlineKeyboardButton("🔔 Atur Notifikasi Hoaks", callback_data='fitur_notifikasi')],
         [InlineKeyboardButton("🔍 Cek Teks / Link Hoaks", callback_data='fitur_cek_teks')],
         [InlineKeyboardButton("🖼️ Verifikasi Gambar", callback_data='fitur_verifikasi_gambar')],
         [InlineKeyboardButton("📰 Cek Lintas Media", callback_data='fitur_crosscheck')],
@@ -127,68 +189,93 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [InlineKeyboardButton("ℹ️ Tentang Bot Ini", callback_data='fitur_tentang')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = f"Halo, *{user.mention_markdown_v2()}*\\!\n\nSelamat datang di Bot Cek Fakta v2\\.0\\.\n\nSaya kini memiliki lebih banyak fitur untuk membantu Anda memverifikasi informasi\\. Silakan pilih menu di bawah ini:"
+    text = f"Halo, *{user.mention_markdown_v2()}*\\!\n\nSelamat datang di Bot Cek Fakta v3\\.0\\.\n\nSaya kini bisa mengirim notifikasi hoaks terbaru secara otomatis\\. Silakan pilih menu di bawah ini:"
     await update.message.reply_markdown_v2(text, reply_markup=reply_markup)
 
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """New handler for the /subscribe command."""
+    chat_id = update.message.chat_id
+    if chat_id in subscribers:
+        await update.message.reply_text("Anda sudah berlangganan notifikasi.")
+    else:
+        subscribers.add(chat_id)
+        save_subscribers()
+        await update.message.reply_text("✅ Berhasil! Anda akan menerima notifikasi hoaks terbaru dari kami.")
+        logger.info(f"User {chat_id} has subscribed.")
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """New handler for the /unsubscribe command."""
+    chat_id = update.message.chat_id
+    if chat_id in subscribers:
+        subscribers.discard(chat_id)
+        save_subscribers()
+        await update.message.reply_text("Anda telah berhenti berlangganan notifikasi.")
+        logger.info(f"User {chat_id} has unsubscribed.")
+    else:
+        await update.message.reply_text("Anda memang belum berlangganan notifikasi.")
+
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Memproses pesan teks: Cek Fakta, Cek Lintas Media, dan Cek Keamanan Link."""
+    """Process text messages: Fact Check, Cross-Reference, and URL Safety Check."""
     query = update.message.text
-    logger.info(f"Menerima query dari user {update.effective_user.id}: {query}")
+    logger.info(f"Received query from user {update.effective_user.id}: {query}")
     
-    # Deteksi URL dalam pesan
     url_pattern = r'https?://\S+'
     found_urls = re.findall(url_pattern, query)
     
     waiting_message = await update.message.reply_text("⏳ Sedang menganalisis, mohon tunggu...")
     
-    # 1. Analisis Keamanan Link (jika ada link)
     security_result = ""
     if found_urls:
         security_result = analyze_url_safety(found_urls[0]) + "\n\n---\n\n"
         
-    # 2. Cek Fakta
     fact_check_result = search_fact_check(query) + "\n\n---\n\n"
-    
-    # 3. Cek Lintas Media
     cross_ref_result = cross_reference_news(query)
     
     final_result = security_result + fact_check_result + cross_ref_result
     await waiting_message.edit_text(final_result, parse_mode='Markdown', disable_web_page_preview=True)
 
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler baru untuk memproses gambar yang dikirim pengguna."""
+    """New handler to process images sent by the user."""
     photo_file = await update.message.photo[-1].get_file()
     image_url = photo_file.file_path
 
-    logger.info(f"Menerima gambar dari user {update.effective_user.id} untuk verifikasi.")
+    logger.info(f"Received image from user {update.effective_user.id} for verification.")
     waiting_message = await update.message.reply_text("🖼️ Sedang memverifikasi gambar, mohon tunggu...")
     
     result_text = verify_image(image_url)
     await waiting_message.edit_text(result_text, parse_mode='Markdown', disable_web_page_preview=True)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Menangani aksi ketika tombol ditekan."""
+    """Handle actions when buttons are pressed."""
     query = update.callback_query
     await query.answer()
     
-    # Teks untuk setiap tombol
-    if query.data == 'fitur_cek_teks':
+    text = ""
+    if query.data == 'fitur_notifikasi':
+        text = (
+            "🔔 *Fitur Notifikasi Hoaks Terbaru*\n\n"
+            "Dapatkan peringatan dini mengenai hoaks atau disinformasi yang sedang viral langsung di chat Anda.\n\n"
+            "Gunakan perintah berikut:\n"
+            "• `/subscribe` - untuk *mulai* menerima notifikasi.\n"
+            "• `/unsubscribe` - untuk *berhenti* menerima notifikasi."
+        )
+    elif query.data == 'fitur_cek_teks':
         text = "Silakan kirimkan potongan berita, judul artikel, atau link yang ingin Anda periksa."
     elif query.data == 'fitur_verifikasi_gambar':
         text = "Silakan kirimkan sebuah gambar (bukan sebagai file/dokumen) untuk saya coba verifikasi."
     elif query.data == 'fitur_crosscheck':
         text = "Ketik `/crosscheck <topik berita>` untuk melihat liputan dari media mainstream.\nContoh: `/crosscheck pemilu 2024`"
     elif query.data == 'fitur_panduan':
-        text = "*💡 Panduan Sederhana Mengenali Hoax:*\n\n1. *Jangan Panik*, berita heboh seringkali memancing emosi.\n2. *Periksa Sumbernya*, apakah dari media kredibel?\n3. *Cek Judul Provokatif*, hoaks seringkali sensasional.\n4. *Bandingkan dengan Berita Lain*, apakah media besar juga meliputnya?"
+        text = "*💡 Panduan Sederhana Mengenali Hoax:*\n\n1. *Jangan Panik*, berita heboh seringkali memancing emosi.\n2. *Periksa Sumbernya*, apakah dari media kredibel?\n3. *Bandingkan dengan Berita Lain*, apakah media besar juga meliputnya?"
     elif query.data == 'fitur_tentang':
-        text = "*ℹ️ Tentang Bot Cek Fakta v2.0*\n\nBot ini menggabungkan beberapa API untuk verifikasi:\n- *Google Custom Search* (Cek Fakta)\n- *Google Web Risk* (Cek Link)\n- *NewsAPI* (Cek Lintas Media)\n- *SerpApi* (Cek Gambar)"
+        text = "*ℹ️ Tentang Bot Cek Fakta v3.0*\n\nBot ini menggabungkan beberapa API untuk verifikasi dan notifikasi:\n- *Google Custom Search* (Cek Fakta)\n- *Google Web Risk* (Cek Link)\n- *NewsAPI* (Cek Lintas Media & Notifikasi)\n- *SerpApi* (Cek Gambar)"
     else:
         text = "Fitur tidak dikenali."
         
-    await query.message.reply_markdown(text)
+    await query.message.reply_markdown(text, disable_web_page_preview=True)
 
 async def crosscheck_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler untuk perintah /crosscheck"""
+    """Handler for the /crosscheck command."""
     try:
         query = " ".join(context.args)
         if not query:
@@ -203,17 +290,27 @@ async def crosscheck_command_handler(update: Update, context: ContextTypes.DEFAU
 
 
 def main() -> None:
-    """Fungsi utama untuk menjalankan bot."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    """Main function to run the bot."""
+    # Load subscribers on bot startup
+    load_subscribers()
 
-    # Daftarkan semua handler
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # --- SCHEDULE NOTIFICATION JOB ---
+    job_queue = application.job_queue
+    # Run the job every 4 hours (14400 seconds), starting 15 seconds after the bot runs
+    job_queue.run_repeating(send_hoax_notification, interval=14400, first=15)
+
+    # Register all handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CommandHandler("crosscheck", crosscheck_command_handler))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_message))
-    application.add_handler(MessageHandler(filters.PHOTO, image_handler)) # Handler baru untuk foto
+    application.add_handler(MessageHandler(filters.PHOTO, image_handler)) # New handler for photos
 
-    logger.info("Bot Cek Fakta v2.0 mulai berjalan...")
+    logger.info("Bot Cek Fakta v3.0 (with Notifications) is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
