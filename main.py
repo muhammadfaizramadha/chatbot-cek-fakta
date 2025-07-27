@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- NEW NOTIFICATION MANAGEMENT ---
+# --- NOTIFICATION MANAGEMENT ---
 SUBSCRIBERS_FILE = 'subscribers.json'
 subscribers = set()
 last_sent_article_url = None
@@ -45,26 +45,27 @@ def save_subscribers():
     with open(SUBSCRIBERS_FILE, 'w') as f:
         json.dump(list(subscribers), f)
 
-def fetch_latest_hoax() -> dict | None:
-    """Fetch the latest hoax clarification article from NewsAPI."""
-    # Query to find clarification/hoax news
-    query = '"klarifikasi hoaks" OR "cek fakta" OR "disinformasi"'
+def fetch_latest_hoaxes(count: int = 1) -> list[dict] | None:
+    """Fetch the latest hoax clarification articles from NewsAPI."""
+    # --- THIS IS THE MODIFIED PART ---
+    # The query is broadened to get more results
+    query = '"hoax" OR "klarifikasi" OR "cek fakta" OR "berita bohong" OR "disinformasi"'
     url = "https://newsapi.org/v2/everything"
     params = {
         'q': query,
         'language': 'id',
         'sortBy': 'publishedAt', # Get the newest
         'apiKey': NEWSAPI_KEY,
-        'pageSize': 1
+        'pageSize': count
     }
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
         data = response.json()
-        if data['totalResults'] > 0:
-            return data['articles'][0] # Return the first (latest) article
+        if data.get('totalResults', 0) > 0:
+            return data.get('articles', []) # Return a list of articles
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching latest hoax from NewsAPI: {e}")
+        logger.error(f"Error fetching latest hoaxes from NewsAPI: {e}")
     return None
 
 async def send_hoax_notification(context: ContextTypes.DEFAULT_TYPE):
@@ -72,34 +73,35 @@ async def send_hoax_notification(context: ContextTypes.DEFAULT_TYPE):
     global last_sent_article_url
     logger.info("Running hoax notification check job...")
 
-    latest_article = fetch_latest_hoax()
+    latest_articles = fetch_latest_hoaxes(count=1)
 
-    if latest_article and latest_article.get('url') != last_sent_article_url:
-        last_sent_article_url = latest_article.get('url')
-        title = latest_article.get('title')
-        url = latest_article.get('url')
-        source = latest_article.get('source', {}).get('name')
+    if latest_articles:
+        latest_article = latest_articles[0]
+        if latest_article and latest_article.get('url') != last_sent_article_url:
+            last_sent_article_url = latest_article.get('url')
+            title = latest_article.get('title')
+            url = latest_article.get('url')
+            source = latest_article.get('source', {}).get('name')
 
-        message = (
-            f"🔔 *Notifikasi Hoaks Terbaru*\n\n"
-            f"*{title}*\n"
-            f"Sumber: {source}\n\n"
-            f"Baca klarifikasi lengkapnya di sini:\n{url}\n\n"
-            f"_Untuk berhenti menerima notifikasi, ketik /unsubscribe_"
-        )
+            message = (
+                f"🔔 *Notifikasi Hoaks Terbaru*\n\n"
+                f"*{title}*\n"
+                f"Sumber: {source}\n\n"
+                f"Baca klarifikasi lengkapnya di sini:\n{url}\n\n"
+                f"_Untuk berhenti menerima notifikasi, ketik /unsubscribe_"
+            )
 
-        # Send to all subscribers
-        for chat_id in list(subscribers): # Iterate over a copy
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
-                logger.info(f"Sent notification to {chat_id}")
-            except Exception as e:
-                logger.warning(f"Failed to send notification to {chat_id}: {e}. Removing subscriber.")
-                subscribers.discard(chat_id)
-                save_subscribers()
+            for chat_id in list(subscribers):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                    logger.info(f"Sent notification to {chat_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to send notification to {chat_id}: {e}. Removing subscriber.")
+                    subscribers.discard(chat_id)
+                    save_subscribers()
 
 
-# --- EXISTING FEATURE FUNCTIONS (Unchanged) ---
+# --- EXISTING FEATURE FUNCTIONS ---
 def cross_reference_news(query: str) -> str:
     """Search query on mainstream Indonesian media via NewsAPI."""
     url = "https://newsapi.org/v2/everything"
@@ -182,18 +184,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     keyboard = [
         [InlineKeyboardButton("🔔 Atur Notifikasi Hoaks", callback_data='fitur_notifikasi')],
+        [InlineKeyboardButton("📰 Lihat Hoaks Terbaru", callback_data='fitur_lihat_hoaks')],
         [InlineKeyboardButton("🔍 Cek Teks / Link Hoaks", callback_data='fitur_cek_teks')],
         [InlineKeyboardButton("🖼️ Verifikasi Gambar", callback_data='fitur_verifikasi_gambar')],
-        [InlineKeyboardButton("📰 Cek Lintas Media", callback_data='fitur_crosscheck')],
         [InlineKeyboardButton("💡 Panduan Kenali Hoax", callback_data='fitur_panduan')],
         [InlineKeyboardButton("ℹ️ Tentang Bot Ini", callback_data='fitur_tentang')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = f"Halo, *{user.mention_markdown_v2()}*\\!\n\nSelamat datang di Bot Cek Fakta v3\\.0\\.\n\nSaya kini bisa mengirim notifikasi hoaks terbaru secara otomatis\\. Silakan pilih menu di bawah ini:"
+    text = f"Halo, *{user.mention_markdown_v2()}*\\!\n\nSelamat datang di Bot Cek Fakta v4\\.0\\.\n\nSaya kini bisa menampilkan daftar hoaks terbaru sesuai permintaan Anda\\. Silakan pilih menu di bawah ini:"
     await update.message.reply_markdown_v2(text, reply_markup=reply_markup)
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """New handler for the /subscribe command."""
+    """Handler for the /subscribe command."""
     chat_id = update.message.chat_id
     if chat_id in subscribers:
         await update.message.reply_text("Anda sudah berlangganan notifikasi.")
@@ -204,7 +206,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.info(f"User {chat_id} has subscribed.")
 
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """New handler for the /unsubscribe command."""
+    """Handler for the /unsubscribe command."""
     chat_id = update.message.chat_id
     if chat_id in subscribers:
         subscribers.discard(chat_id)
@@ -213,6 +215,26 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"User {chat_id} has unsubscribed.")
     else:
         await update.message.reply_text("Anda memang belum berlangganan notifikasi.")
+
+async def latest_hoaxes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for the /hoaxterbaru command."""
+    waiting_message = await update.message.reply_text("📰 Sedang mengambil berita hoaks terbaru, mohon tunggu...")
+    
+    articles = fetch_latest_hoaxes(count=5)
+    
+    if articles:
+        message = "📰 *5 Klarifikasi Hoaks Terbaru:*\n\n---\n\n"
+        for article in articles:
+            title = article.get('title')
+            url = article.get('url')
+            source = article.get('source', {}).get('name', 'N/A')
+            message += f"*{title}*\n"
+            message += f"Sumber: {source}\n"
+            message += f"[Baca selengkapnya]({url})\n\n---\n\n"
+        
+        await waiting_message.edit_text(message, parse_mode='Markdown', disable_web_page_preview=True)
+    else:
+        await waiting_message.edit_text("Gagal mengambil berita hoaks terbaru saat ini. Silakan coba lagi nanti.")
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process text messages: Fact Check, Cross-Reference, and URL Safety Check."""
@@ -235,7 +257,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await waiting_message.edit_text(final_result, parse_mode='Markdown', disable_web_page_preview=True)
 
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """New handler to process images sent by the user."""
+    """Handler to process images sent by the user."""
     photo_file = await update.message.photo[-1].get_file()
     image_url = photo_file.file_path
 
@@ -250,29 +272,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     
-    text = ""
+    # Each block now handles its own response
     if query.data == 'fitur_notifikasi':
         text = (
-            "🔔 *Fitur Notifikasi Hoaks Terbaru*\n\n"
+            "� *Fitur Notifikasi Hoaks Terbaru*\n\n"
             "Dapatkan peringatan dini mengenai hoaks atau disinformasi yang sedang viral langsung di chat Anda.\n\n"
             "Gunakan perintah berikut:\n"
             "• `/subscribe` - untuk *mulai* menerima notifikasi.\n"
             "• `/unsubscribe` - untuk *berhenti* menerima notifikasi."
         )
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
+        
+    elif query.data == 'fitur_lihat_hoaks':
+        text = "Untuk melihat 5 klarifikasi hoaks terbaru, silakan gunakan perintah:\n\n/hoaxterbaru"
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
+        
     elif query.data == 'fitur_cek_teks':
         text = "Silakan kirimkan potongan berita, judul artikel, atau link yang ingin Anda periksa."
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
+        
     elif query.data == 'fitur_verifikasi_gambar':
         text = "Silakan kirimkan sebuah gambar (bukan sebagai file/dokumen) untuk saya coba verifikasi."
-    elif query.data == 'fitur_crosscheck':
-        text = "Ketik `/crosscheck <topik berita>` untuk melihat liputan dari media mainstream.\nContoh: `/crosscheck pemilu 2024`"
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
+        
     elif query.data == 'fitur_panduan':
-        text = "*💡 Panduan Sederhana Mengenali Hoax:*\n\n1. *Jangan Panik*, berita heboh seringkali memancing emosi.\n2. *Periksa Sumbernya*, apakah dari media kredibel?\n3. *Bandingkan dengan Berita Lain*, apakah media besar juga meliputnya?"
+        # --- THIS IS THE MODIFIED PART ---
+        photo_url = "D:\KULIAH\SKRIPSI\chatbot-cek-fakta\panduan_kenali_hoax.webp"
+        caption_text = "Berikut adalah panduan visual untuk mengenali hoaks."
+        await query.message.reply_photo(photo=photo_url, caption=caption_text)
+        
     elif query.data == 'fitur_tentang':
-        text = "*ℹ️ Tentang Bot Cek Fakta v3.0*\n\nBot ini menggabungkan beberapa API untuk verifikasi dan notifikasi:\n- *Google Custom Search* (Cek Fakta)\n- *Google Web Risk* (Cek Link)\n- *NewsAPI* (Cek Lintas Media & Notifikasi)\n- *SerpApi* (Cek Gambar)"
+        text = "*ℹ️ Tentang Bot Cek Fakta v4.0*\n\nBot ini menggabungkan beberapa API untuk verifikasi dan notifikasi:\n- *Google Custom Search* (Cek Fakta)\n- *Google Web Risk* (Cek Link)\n- *NewsAPI* (Cek Lintas Media & Notifikasi)\n- *SerpApi* (Cek Gambar)"
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
+        
     else:
         text = "Fitur tidak dikenali."
-        
-    await query.message.reply_markdown(text, disable_web_page_preview=True)
+        await query.message.reply_markdown(text, disable_web_page_preview=True)
 
 async def crosscheck_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handler for the /crosscheck command."""
@@ -305,12 +340,13 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    application.add_handler(CommandHandler("hoaxterbaru", latest_hoaxes_command))
     application.add_handler(CommandHandler("crosscheck", crosscheck_command_handler))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_message))
-    application.add_handler(MessageHandler(filters.PHOTO, image_handler)) # New handler for photos
+    application.add_handler(MessageHandler(filters.PHOTO, image_handler))
 
-    logger.info("Bot Cek Fakta v3.0 (with Notifications) is starting...")
+    logger.info("Bot Cek Fakta v4.0 (with Visual Guide) is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
